@@ -41,6 +41,7 @@ type DsmrV10 = Vec<TelegramV10>;
 
 #[derive(Debug)]
 struct TelegramV10 {
+    date: String,
     event_log: EventLog,
     information: Electricity,
 }
@@ -65,7 +66,7 @@ struct Electricity {
     total_produced: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 enum Severity {
     Low,
     High,
@@ -73,10 +74,10 @@ enum Severity {
 
 #[derive(Clone, Debug)]
 struct EventLog {
-    id: u32,
+    ids: Vec<u32>,
     severities: Vec<Severity>, // should be String?
-    date: i64,
-    message: String,
+    dates: Vec<i64>,
+    messages: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -106,12 +107,11 @@ fn parse_v10(input: &str) -> Result<DsmrV10, ParseError> {
         total_produced: 0.0,
     };
 
-    let mut event_log = EventLog {
-        id: 0,
-        severities: vec![],
-        date: -1,
-        message: String::new(),
-    };
+    // TODO: i64 should be UnixTimeStamp for clarity
+    let mut telegram_date = String::new();
+    let mut dates = Vec::new();
+    let mut messages = Vec::new();
+    let mut severities = Vec::new();
 
     let mut seen_info_type = false;
     let mut has_electricity = false;
@@ -138,11 +138,58 @@ fn parse_v10(input: &str) -> Result<DsmrV10, ParseError> {
                         return Err(ParseError::NoDate);
                     }
 
+                    // sort by the event id
+                    dates.sort_unstable_by(|ent_a: &(u32, i64), ent_b: &(u32, i64)| {
+                        ent_a.0.partial_cmp(&ent_b.0).unwrap()
+                    });
+                    severities.sort_unstable_by(
+                        |ent_a: &(u32, Severity), ent_b: &(u32, Severity)| {
+                            ent_a.0.partial_cmp(&ent_b.0).unwrap()
+                        },
+                    );
+                    messages.sort_unstable_by(|ent_a: &(u32, String), ent_b: &(u32, String)| {
+                        ent_a.0.partial_cmp(&ent_b.0).unwrap()
+                    });
+
+                    // ensure the whole thing correlate
+                    assert!(dates.len() == severities.len());
+                    assert!(dates.len() == messages.len());
+
+                    let mut event_log = EventLog {
+                        ids: Vec::new(),
+                        dates: Vec::new(),
+                        messages: Vec::new(),
+                        severities: Vec::new(),
+                    };
+
+                    for i in 0..dates.len() {
+                        let ent_date = dates[i];
+                        let ent_sev = severities[i];
+                        let ent_msg = messages[i].clone();
+
+                        // ensure the IDs are the same
+                        assert!(ent_date.0 == ent_msg.0);
+                        assert!(ent_date.0 == ent_sev.0);
+
+                        let id = ent_date.0;
+
+                        event_log.ids.push(id);
+                        event_log.dates.push(ent_date.1);
+                        event_log.messages.push(ent_msg.1);
+                        event_log.severities.push(ent_sev.1);
+                    }
+
                     // push it to list
-                    dsmr.push(TelegramV10 {
+                    let telegram_v10 = TelegramV10 {
+                        date: telegram_date.clone(),
                         event_log: event_log.clone(),
                         information: electricity.clone(),
-                    });
+                    };
+                    // get the compiler to shut up
+                    _ = telegram_v10.date;
+                    _ = telegram_v10.event_log;
+                    _ = telegram_v10.information;
+                    dsmr.push(telegram_v10);
                 }
 
                 // new telegram
@@ -150,10 +197,10 @@ fn parse_v10(input: &str) -> Result<DsmrV10, ParseError> {
                 has_electricity = false;
                 has_telegram_date = false;
 
-                event_log.id = 0;
-                event_log.date = -1;
-                event_log.severities.clear();
-                event_log.message.clear();
+                telegram_date.clear();
+                dates.clear();
+                severities.clear();
+                messages.clear();
 
                 electricity.power = 0.0;
                 electricity.voltage = 0.0;
@@ -163,30 +210,29 @@ fn parse_v10(input: &str) -> Result<DsmrV10, ParseError> {
             }
             b'2' => {
                 let idx = line.rfind(')').unwrap();
-                let val = &bytes[5..idx];
-                println!("2.1#({})", str::from_utf8(val).unwrap());
+                telegram_date = String::from_utf8_lossy(&bytes[5..idx]).to_string();
                 has_telegram_date = true;
             }
             b'3' => {
                 // parse eventlog
 
+                // in 3.x.n; x is discriminant, n is event id
                 let discriminant = bytes[2] as char;
                 let paren = line.rfind(')').unwrap();
                 let val = &bytes[7..paren];
 
                 let event_id = bytes[4] as char;
-                event_log.id = event_id.to_digit(10).unwrap();
+                let event_id = event_id.to_digit(10).unwrap();
                 match discriminant {
-                    '1' => {
-                        event_log
-                            .severities
-                            .push(if matches!(bytes[7] as char, 'H') {
-                                Severity::High
-                            } else {
-                                Severity::Low
-                            });
-                    }
-                    '2' => event_log.message = String::from_utf8_lossy(&val).to_string(),
+                    '1' => severities.push((
+                        event_id,
+                        if matches!(bytes[7] as char, 'H') {
+                            Severity::High
+                        } else {
+                            Severity::Low
+                        },
+                    )),
+                    '2' => messages.push((event_id, String::from_utf8_lossy(&val).to_string())),
                     '3' => {
                         // parse date
 
@@ -201,18 +247,19 @@ fn parse_v10(input: &str) -> Result<DsmrV10, ParseError> {
                         let ss: u8 = (&date[16..18]).parse().unwrap();
                         let mmm: u8 = get_month_as_uint(&date[3..6]);
 
-                        println!("data: {yy}-{mmm}-{dd} {hh}:{mm}:{ss}");
-
-                        event_log.date = tudelft_dsmr_output_generator::date_to_timestamp(
-                            yy,
-                            mmm,
-                            dd,
-                            hh,
-                            mm,
-                            ss,
-                            dts == 'S',
-                        )
-                        .unwrap();
+                        dates.push((
+                            event_id,
+                            tudelft_dsmr_output_generator::date_to_timestamp(
+                                yy,
+                                mmm,
+                                dd,
+                                hh,
+                                mm,
+                                ss,
+                                dts == 'S',
+                            )
+                            .unwrap(),
+                        ))
                     }
                     _ => unreachable!(),
                 }
@@ -225,7 +272,6 @@ fn parse_v10(input: &str) -> Result<DsmrV10, ParseError> {
                 }
 
                 seen_info_type = true;
-                println!("4.1#({})", bytes[5] as char);
             }
             b'7' => {
                 // parse electricity
@@ -274,9 +320,6 @@ fn parse_v10(input: &str) -> Result<DsmrV10, ParseError> {
             _ => {}
         }
     }
-    // println!("electricity: {electricity:#?}");
-    // println!("Event log: {event_log:#?}");
-
     Ok(dsmr)
 }
 
